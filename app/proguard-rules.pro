@@ -1,0 +1,2 @@
+-dontwarn org.checkerframework.**
+-dontwarn javax.annotation.**
