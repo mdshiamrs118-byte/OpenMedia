@@ -6,6 +6,7 @@ import android.os.Bundle
 import android.provider.Settings
 import android.view.View
 import android.widget.Button
+import android.widget.RadioGroup
 import android.widget.SeekBar
 import android.widget.TextView
 import androidx.fragment.app.Fragment
@@ -17,6 +18,22 @@ class SettingsFragment : Fragment(R.layout.fragment_settings) {
         val sp = requireContext().getSharedPreferences("settings", Context.MODE_PRIVATE)
         bind(view.findViewById(R.id.rateBar), view.findViewById(R.id.rateVal), "tts_rate", sp)
         bind(view.findViewById(R.id.pitchBar), view.findViewById(R.id.pitchVal), "tts_pitch", sp)
+        val group = view.findViewById<RadioGroup>(R.id.modeGroup)
+        group.check(
+            when (sp.getString("overlap_mode", "hybrid")) {
+                "overlap" -> R.id.modeOverlap
+                "skip" -> R.id.modeSkip
+                else -> R.id.modeHybrid
+            }
+        )
+        group.setOnCheckedChangeListener { _, id ->
+            val m = when (id) {
+                R.id.modeOverlap -> "overlap"
+                R.id.modeSkip -> "skip"
+                else -> "hybrid"
+            }
+            sp.edit().putString("overlap_mode", m).apply()
+        }
         view.findViewById<Button>(R.id.btnTtsSettings).setOnClickListener {
             try {
                 startActivity(Intent("com.android.settings.TTS_SETTINGS"))

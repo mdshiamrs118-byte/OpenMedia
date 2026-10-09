@@ -40,7 +40,7 @@ object Fmt {
 object Perm {
     fun list(): Array<String> =
         if (Build.VERSION.SDK_INT >= 33)
-            arrayOf(Manifest.permission.READ_MEDIA_VIDEO, Manifest.permission.READ_MEDIA_AUDIO)
+            arrayOf(Manifest.permission.READ_MEDIA_VIDEO)
         else arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
 
     fun has(ctx: Context): Boolean =

@@ -2,8 +2,6 @@ package com.openmedia.app
 
 import android.content.Context
 import android.content.Intent
-import android.media.AudioAttributes
-import android.media.MediaPlayer
 import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
@@ -31,7 +29,6 @@ import androidx.media3.common.VideoSize
 import androidx.media3.exoplayer.ExoPlayer
 import java.io.IOException
 import java.util.concurrent.CancellationException
-import kotlin.math.abs
 
 class PlayerActivity : AppCompatActivity() {
 
@@ -60,9 +57,8 @@ class PlayerActivity : AppCompatActivity() {
     private lateinit var videoKey: String
     private var extraDur = 0L
 
-    private var ttsPlayer: MediaPlayer? = null
+    private var clipPlayer: ClipPlayer? = null
     private var ttsReady = false
-    private var lastTtsSeek = 0L
     private var cues: List<Cue> = emptyList()
 
     private var vw = 0
@@ -93,7 +89,6 @@ class PlayerActivity : AppCompatActivity() {
                 remaining.text = "-" + Fmt.time(duration() - pos)
             }
             updateCue(pos)
-            syncTts(false)
             ui.postDelayed(this, 250)
         }
     }
@@ -132,7 +127,7 @@ class PlayerActivity : AppCompatActivity() {
         player.addListener(object : Player.Listener {
             override fun onIsPlayingChanged(isPlaying: Boolean) {
                 btnPlay.setImageResource(if (isPlaying) R.drawable.ic_pause else R.drawable.ic_play)
-                syncTts(true)
+                if (isPlaying) clipPlayer?.resume() else clipPlayer?.pause()
                 scheduleHide()
             }
 
@@ -154,7 +149,7 @@ class PlayerActivity : AppCompatActivity() {
             override fun onPositionDiscontinuity(
                 oldPosition: Player.PositionInfo, newPosition: Player.PositionInfo, reason: Int
             ) {
-                syncTts(true)
+                clipPlayer?.seek(newPosition.positionMs)
             }
 
             override fun onPlayerError(error: PlaybackException) {
@@ -212,7 +207,7 @@ class PlayerActivity : AppCompatActivity() {
         })
         volTts.setOnSeekBarChangeListener(object : SimpleSeek() {
             override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
-                ttsPlayer?.setVolume(progress / 100f, progress / 100f)
+                clipPlayer?.setVolume(progress / 100f)
                 if (fromUser) prefs.edit().putInt("vol_tts", progress).apply()
             }
         })
@@ -285,7 +280,6 @@ class PlayerActivity : AppCompatActivity() {
         busy = true
         val wasPlaying = player.isPlaying
         player.pause()
-        val baseDur = duration()
         val title = videoTitle
         val key = videoKey
         Bg.io.execute {
@@ -298,25 +292,24 @@ class PlayerActivity : AppCompatActivity() {
                 if (parsed.isEmpty()) throw IllegalStateException("No subtitle cues found in this file")
 
                 val cacheKey = "$key|$text|${prefs.getFloat("tts_rate", 1f)}|${prefs.getFloat("tts_pitch", 1f)}"
-                val fileName = "TTS_${Util.safeName(title)}_${Util.sha1(cacheKey).take(10)}.wav"
+                val dir = ClipStore.dir(this, "TTS_${Util.safeName(title)}_${Util.sha1(cacheKey).take(10)}")
 
-                var audio = MediaRepo.findAudio(this, fileName) // cache hit => skip generation
-                if (audio == null) {
+                var set = ClipStore.load(dir) // cache hit => skip generation
+                if (set == null) {
                     val g = TtsGenerator(this)
                     gen = g
                     ui.post { showProgress() }
-                    val total = if (baseDur > 0) baseDur else parsed.last().endMs + 1000
-                    audio = g.generate(parsed, total, fileName, title, subName) { p ->
+                    set = g.generate(parsed, dir, title, subName) { p ->
                         ui.post {
                             dlgBar?.progress = p
                             dlgPct?.text = "$p%"
                         }
                     }
                 }
-                val result = audio
+                val result: ClipSet = set ?: throw IllegalStateException("TTS generation failed")
                 ui.post {
                     dismissProgress()
-                    loadTts(result, parsed)
+                    loadClips(result)
                     if (wasPlaying) player.play()
                 }
             } catch (e: CancellationException) {
@@ -347,61 +340,18 @@ class PlayerActivity : AppCompatActivity() {
         busy = false
     }
 
-    private fun loadTts(uri: Uri, c: List<Cue>) {
-        ttsPlayer?.release()
-        ttsPlayer = null
-        ttsReady = false
-        cues = c
-        val mp = MediaPlayer()
-        try {
-            mp.setAudioAttributes(
-                AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_MEDIA)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build()
-            )
-            mp.setDataSource(this, uri)
-            mp.setOnPreparedListener {
-                ttsReady = true
-                val v = findViewById<SeekBar>(R.id.volTts).progress / 100f
-                it.setVolume(v, v)
-                volPanel.visibility = View.VISIBLE
-                syncTts(true)
-            }
-            mp.setOnErrorListener { _, _, _ ->
-                Toast.makeText(this, "Cannot play generated audio", Toast.LENGTH_SHORT).show()
-                true
-            }
-            mp.prepareAsync()
-            ttsPlayer = mp
-        } catch (e: Exception) {
-            mp.release()
-            Toast.makeText(this, "Cannot load generated audio", Toast.LENGTH_SHORT).show()
-        }
-    }
-
-    /** Keeps the TTS track locked to the video position and play state. */
-    private fun syncTts(force: Boolean) {
-        val mp = ttsPlayer ?: return
-        if (!ttsReady) return
-        try {
-            val pos = player.currentPosition
-            val now = System.currentTimeMillis()
-            if (player.isPlaying) {
-                if (pos >= mp.duration) {
-                    if (mp.isPlaying) mp.pause()
-                    return
-                }
-                if ((force || abs(mp.currentPosition - pos) > 300) && now - lastTtsSeek > 800) {
-                    mp.seekTo(pos, MediaPlayer.SEEK_CLOSEST)
-                    lastTtsSeek = now
-                }
-                if (!mp.isPlaying) mp.start()
-            } else {
-                if (mp.isPlaying) mp.pause()
-                if (force) mp.seekTo(pos, MediaPlayer.SEEK_CLOSEST)
-            }
-        } catch (_: IllegalStateException) {
-        }
+    private fun loadClips(set: ClipSet) {
+        clipPlayer?.release()
+        cues = set.clips.map { Cue(it.cueStart, it.cueEnd, it.text) }
+        val mode = OverlapMode.from(prefs.getString("overlap_mode", "hybrid"))
+        val cp = ClipPlayer(this) { player.currentPosition }
+        cp.load(Planner.plan(set.clips, mode))
+        cp.setVolume(findViewById<SeekBar>(R.id.volTts).progress / 100f)
+        cp.seek(player.currentPosition)
+        if (player.isPlaying) cp.resume()
+        clipPlayer = cp
+        ttsReady = true
+        volPanel.visibility = View.VISIBLE
     }
 
     // ---- Lifecycle ---------------------------------------------------------
@@ -410,10 +360,7 @@ class PlayerActivity : AppCompatActivity() {
         super.onPause()
         if (!::player.isInitialized) return
         player.pause()
-        try {
-            ttsPlayer?.pause()
-        } catch (_: IllegalStateException) {
-        }
+        clipPlayer?.pause()
         val d = duration()
         val p = player.currentPosition
         resume.edit().putLong(videoKey, if (d > 0 && p > d - 5000) 0L else p).apply()
@@ -423,8 +370,8 @@ class PlayerActivity : AppCompatActivity() {
         gen?.cancelled = true
         ui.removeCallbacksAndMessages(null)
         dialog?.dismiss()
-        ttsPlayer?.release()
-        ttsPlayer = null
+        clipPlayer?.release()
+        clipPlayer = null
         if (::player.isInitialized) player.release()
         super.onDestroy()
     }

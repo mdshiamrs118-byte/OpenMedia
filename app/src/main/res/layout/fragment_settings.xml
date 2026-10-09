@@ -89,6 +89,72 @@
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_marginTop="24dp"
+            android:text="Overlapping subtitles"
+            android:textColor="@color/accent"
+            android:textSize="14sp"
+            android:textStyle="bold" />
+
+        <RadioGroup
+            android:id="@+id/modeGroup"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:orientation="vertical">
+        <RadioButton
+            android:id="@+id/modeOverlap"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Overlap"
+            android:textColor="@color/text" />
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="32dp"
+            android:layout_marginBottom="8dp"
+            android:text="Every line plays at its exact start time, even if another line is still speaking."
+            android:textColor="@color/text2"
+            android:textSize="12sp" />
+        <RadioButton
+            android:id="@+id/modeSkip"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Skip overlaps"
+            android:textColor="@color/text" />
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="32dp"
+            android:layout_marginBottom="8dp"
+            android:text="Never two voices at once. A line that would start while another is still speaking is dropped."
+            android:textColor="@color/text2"
+            android:textSize="12sp" />
+        <RadioButton
+            android:id="@+id/modeHybrid"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Hybrid (recommended)"
+            android:textColor="@color/text" />
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="32dp"
+            android:layout_marginBottom="8dp"
+            android:text="No overlap. Speech is sped up (up to 2x) to stay in sync. Overlapping lines are sped up together to fit their combined time window."
+            android:textColor="@color/text2"
+            android:textSize="12sp" />
+        </RadioGroup>
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Applies the next time you open a video or play a track. No need to regenerate audio."
+            android:textColor="@color/text2"
+            android:textSize="12sp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="24dp"
             android:text="Storage"
             android:textColor="@color/accent"
             android:textSize="14sp"
@@ -97,7 +163,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="8dp"
-            android:text="Generated audio is saved in Music/Subtitle TTS and listed in the Music tab. Long-press a track there to delete it."
+            android:text="Each subtitle line is saved as its own small audio file in the app's Music folder (Android/data/com.openmedia.app/files/Music/Subtitle TTS) and listed in the Music tab. Long-press a track there to delete it."
             android:textColor="@color/text2"
             android:textSize="13sp" />
 

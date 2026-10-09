@@ -1,224 +1,167 @@
 package com.openmedia.app
 
-import android.content.ContentValues
 import android.content.Context
-import android.net.Uri
 import android.os.Bundle
-import android.os.Environment
-import android.provider.MediaStore
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import java.io.File
-import java.io.IOException
-import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.Locale
 import java.util.concurrent.CancellationException
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicIntegerArray
 
 /**
- * Turns subtitle cues into one WAV track using Android's built-in TTS.
- * Each cue is synthesized, then written at its timestamp (silence is streamed in
- * between), so memory use stays tiny even for feature-length videos.
+ * Synthesizes every subtitle line to its own small WAV file, in parallel:
+ * several TextToSpeech engines run side by side, and each keeps a few requests queued so the engine is
+ * never idle between lines. Nothing is merged; ClipPlayer plays the clips at their timestamps.
  * Call generate() from a background thread.
  */
 class TtsGenerator(private val ctx: Context) {
     @Volatile
     var cancelled = false
 
-    @Volatile
-    private var latch = CountDownLatch(0)
-
-    @Volatile
-    private var failed = false
-
-    private class Wav(val rate: Int, val pcm: ByteArray)
+    private companion object {
+        const val ENGINES = 3
+        const val DEPTH = 4
+    }
 
     fun generate(
-        cues: List<Cue>, totalMs: Long, outName: String,
-        videoTitle: String, subName: String, onProgress: (Int) -> Unit
-    ): Uri {
+        cues: List<Cue>, dir: File, videoTitle: String, subName: String, onProgress: (Int) -> Unit
+    ): ClipSet {
         val sp = ctx.getSharedPreferences("settings", Context.MODE_PRIVATE)
-        val initLatch = CountDownLatch(1)
-        var ready = false
-        val engine = TextToSpeech(ctx.applicationContext) { status ->
-            ready = status == TextToSpeech.SUCCESS
-            initLatch.countDown()
-        }
-        if (!initLatch.await(15, TimeUnit.SECONDS) || !ready) {
-            engine.shutdown()
-            throw IllegalStateException("Text-to-speech engine is not available")
-        }
-        val tmp = File(ctx.cacheDir, "tts_out.wav")
-        val cueFile = File(ctx.cacheDir, "tts_cue.wav")
-        var durationMs = 0L
+        val rate = sp.getFloat("tts_rate", 1f)
+        val pitch = sp.getFloat("tts_pitch", 1f)
+        dir.deleteRecursively()
+        dir.mkdirs()
+        val engines = initEngines()
+        var ok = false
         try {
-            if (engine.setLanguage(Locale.getDefault()) < 0) engine.setLanguage(Locale.US)
-            engine.setSpeechRate(sp.getFloat("tts_rate", 1f))
-            engine.setPitch(sp.getFloat("tts_pitch", 1f))
-            engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                override fun onStart(utteranceId: String?) {}
-                override fun onDone(utteranceId: String?) {
-                    latch.countDown()
-                }
+            if (engines.isEmpty()) throw IllegalStateException("Text-to-speech engine is not available")
+            val n = cues.size
+            val next = AtomicInteger(0)
+            val finished = AtomicInteger(0)
+            val seen = AtomicIntegerArray(n)
+            val results = arrayOfNulls<Clip>(n)
+            val allDone = CountDownLatch(1)
 
-                @Deprecated("Deprecated in Java")
-                override fun onError(utteranceId: String?) {
-                    failed = true
-                    latch.countDown()
-                }
+            fun finish(i: Int, success: Boolean) {
+                if (!seen.compareAndSet(i, 0, 1)) return
+                val f = File(dir, "c$i.wav")
+                val d = if (success) wavDurationMs(f) else 0L
+                if (d >= 30) results[i] = Clip(f, cues[i].startMs, cues[i].endMs, d, cues[i].text) else f.delete()
+                if (finished.incrementAndGet() == n) allDone.countDown()
+            }
 
-                override fun onError(utteranceId: String?, errorCode: Int) {
-                    failed = true
-                    latch.countDown()
+            fun submit(engine: TextToSpeech) {
+                while (!cancelled) {
+                    val i = next.getAndIncrement()
+                    if (i >= n) return
+                    val r = engine.synthesizeToFile(cues[i].text.take(3900), Bundle(), File(dir, "c$i.wav"), "c$i")
+                    if (r == TextToSpeech.SUCCESS) return
+                    finish(i, false)
                 }
-            })
+            }
 
-            RandomAccessFile(tmp, "rw").use { raf ->
-                raf.setLength(0)
-                raf.write(ByteArray(44))
-                var outRate = 0
-                var pos = 0L
-                val zeros = ByteArray(65536)
-                fun pad(toBytes: Long) {
-                    var n = toBytes - pos
-                    while (n > 0) {
-                        val k = minOf(n, zeros.size.toLong()).toInt()
-                        raf.write(zeros, 0, k)
-                        n -= k
-                        pos += k
+            fun idx(id: String?): Int? = id?.removePrefix("c")?.toIntOrNull()
+
+            for (e in engines) {
+                if (e.setLanguage(Locale.getDefault()) < 0) e.setLanguage(Locale.US)
+                e.setSpeechRate(rate)
+                e.setPitch(pitch)
+                e.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                    override fun onStart(utteranceId: String?) {}
+                    override fun onDone(utteranceId: String?) {
+                        idx(utteranceId)?.let {
+                            finish(it, true)
+                            submit(e)
+                        }
                     }
-                }
 
-                for ((i, cue) in cues.withIndex()) {
-                    if (cancelled) throw CancellationException("Cancelled")
-                    onProgress(i * 100 / cues.size)
-                    val wav = synth(engine, cue.text, cueFile, "u$i") ?: continue
-                    if (outRate == 0) outRate = wav.rate
-                    val pcm = if (wav.rate == outRate) wav.pcm else resample(wav.pcm, wav.rate, outRate)
-                    pad((cue.startMs * outRate / 1000) * 2)
-                    raf.write(pcm)
-                    pos += pcm.size
-                }
-                if (outRate == 0) throw IllegalStateException("No speech could be generated from this subtitle")
-                pad((totalMs * outRate / 1000) * 2)
-                writeHeader(raf, outRate, pos)
-                durationMs = pos / 2 * 1000 / outRate
+                    @Deprecated("Deprecated in Java")
+                    override fun onError(utteranceId: String?) {
+                    }
+
+                    override fun onError(utteranceId: String?, errorCode: Int) {
+                        idx(utteranceId)?.let {
+                            finish(it, false)
+                            submit(e)
+                        }
+                    }
+                })
             }
+            repeat(DEPTH) { for (e in engines) submit(e) }
+
+            var last = -1
+            var lastChange = System.currentTimeMillis()
+            while (!allDone.await(250, TimeUnit.MILLISECONDS)) {
+                if (cancelled) throw CancellationException("Cancelled")
+                val f = finished.get()
+                if (f != last) {
+                    last = f
+                    lastChange = System.currentTimeMillis()
+                    onProgress(f * 100 / n)
+                } else if (System.currentTimeMillis() - lastChange > 120_000) {
+                    throw IllegalStateException("Text-to-speech stopped responding")
+                }
+            }
+            if (cancelled) throw CancellationException("Cancelled")
+            val clips = results.filterNotNull()
+            if (clips.isEmpty()) throw IllegalStateException("No speech could be generated from this subtitle")
             onProgress(100)
-            return saveToMusic(tmp, outName, videoTitle, subName, durationMs)
+            val set = ClipStore.save(dir, videoTitle, subName, clips)
+            ok = true
+            return set
         } finally {
-            engine.stop()
-            engine.shutdown()
-            tmp.delete()
-            cueFile.delete()
-        }
-    }
-
-    private fun saveToMusic(src: File, name: String, videoTitle: String, subName: String, durMs: Long): Uri {
-        val resolver = ctx.contentResolver
-        val values = ContentValues().apply {
-            put(MediaStore.Audio.Media.DISPLAY_NAME, name)
-            put(MediaStore.Audio.Media.MIME_TYPE, "audio/x-wav")
-            put(MediaStore.Audio.Media.RELATIVE_PATH, "${Environment.DIRECTORY_MUSIC}/${MediaRepo.TTS_DIR}")
-            put(MediaStore.Audio.Media.TITLE, videoTitle)
-            put(MediaStore.Audio.Media.ARTIST, subName)
-            put(MediaStore.Audio.Media.IS_PENDING, 1)
-        }
-        val uri = resolver.insert(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, values)
-            ?: throw IOException("Cannot create audio file in Music folder")
-        try {
-            val out = resolver.openOutputStream(uri) ?: throw IOException("Cannot open output stream")
-            out.use { o -> src.inputStream().use { it.copyTo(o) } }
-        } catch (e: Exception) {
-            resolver.delete(uri, null, null)
-            throw e
-        }
-        values.clear()
-        values.put(MediaStore.Audio.Media.IS_PENDING, 0)
-        resolver.update(uri, values, null, null)
-        MediaRepo.saveMeta(ctx, name, videoTitle, subName, durMs)
-        return uri
-    }
-
-    private fun synth(engine: TextToSpeech, text: String, f: File, id: String): Wav? {
-        f.delete()
-        failed = false
-        latch = CountDownLatch(1)
-        if (engine.synthesizeToFile(text.take(3900), Bundle(), f, id) != TextToSpeech.SUCCESS) return null
-        if (!latch.await(60, TimeUnit.SECONDS) || failed) return null
-        return readWav(f)
-    }
-
-    private fun readWav(f: File): Wav? {
-        if (!f.exists() || f.length() < 44) return null
-        val b = f.readBytes()
-        val bb = ByteBuffer.wrap(b).order(ByteOrder.LITTLE_ENDIAN)
-        var p = 12
-        var rate = 0
-        var ch = 1
-        var bits = 16
-        while (p + 8 <= b.size) {
-            val id = String(b, p, 4, Charsets.US_ASCII)
-            var size = bb.getInt(p + 4)
-            if (id == "fmt ") {
-                ch = bb.getShort(p + 10).toInt()
-                rate = bb.getInt(p + 12)
-                bits = bb.getShort(p + 22).toInt()
-            } else if (id == "data") {
-                val start = p + 8
-                if (size < 0 || start + size > b.size) size = b.size - start
-                if (rate == 0 || bits != 16) return null
-                var pcm = b.copyOfRange(start, start + size)
-                if (ch == 2) pcm = downmix(pcm)
-                return Wav(rate, pcm.copyOf(pcm.size and -2))
+            for (e in engines) {
+                try {
+                    e.stop()
+                    e.shutdown()
+                } catch (_: Exception) {
+                }
             }
-            if (size < 0) return null
+            if (!ok) dir.deleteRecursively()
+        }
+    }
+
+    private fun initEngines(): List<TextToSpeech> {
+        val latch = CountDownLatch(ENGINES)
+        val oks = BooleanArray(ENGINES)
+        val all = ArrayList<TextToSpeech>()
+        for (k in 0 until ENGINES) {
+            all += TextToSpeech(ctx.applicationContext) { st ->
+                oks[k] = st == TextToSpeech.SUCCESS
+                latch.countDown()
+            }
+        }
+        latch.await(15, TimeUnit.SECONDS)
+        val good = ArrayList<TextToSpeech>()
+        all.forEachIndexed { k, e -> if (oks[k]) good += e else e.shutdown() }
+        return good
+    }
+
+    /** Duration of a WAV from its header (the data size field is ignored; file length is used). */
+    private fun wavDurationMs(f: File): Long {
+        if (!f.exists() || f.length() < 44) return 0L
+        val head = ByteArray(minOf(f.length(), 4096L).toInt())
+        f.inputStream().use { it.read(head) }
+        val bb = ByteBuffer.wrap(head).order(ByteOrder.LITTLE_ENDIAN)
+        var p = 12
+        var byteRate = 0
+        while (p + 8 <= head.size) {
+            val id = String(head, p, 4, Charsets.US_ASCII)
+            val size = bb.getInt(p + 4)
+            if (id == "fmt " && p + 20 <= head.size) {
+                byteRate = bb.getInt(p + 16)
+            } else if (id == "data") {
+                return if (byteRate > 0) (f.length() - (p + 8)) * 1000 / byteRate else 0L
+            }
+            if (size < 0) return 0L
             p += 8 + size + (size and 1)
         }
-        return null
-    }
-
-    private fun downmix(s: ByteArray): ByteArray {
-        val n = s.size / 4
-        val o = ByteArray(n * 2)
-        for (i in 0 until n) {
-            val l = (s[4 * i + 1].toInt() shl 8) or (s[4 * i].toInt() and 0xFF)
-            val r = (s[4 * i + 3].toInt() shl 8) or (s[4 * i + 2].toInt() and 0xFF)
-            val a = (l + r) / 2
-            o[2 * i] = a.toByte()
-            o[2 * i + 1] = (a shr 8).toByte()
-        }
-        return o
-    }
-
-    private fun resample(src: ByteArray, from: Int, to: Int): ByteArray {
-        val n = src.size / 2
-        if (n == 0) return src
-        val m = (n.toLong() * to / from).toInt()
-        val o = ByteArray(m * 2)
-        fun s(i: Int) = (src[2 * i + 1].toInt() shl 8) or (src[2 * i].toInt() and 0xFF)
-        for (j in 0 until m) {
-            val x = j.toDouble() * from / to
-            val i = x.toInt().coerceAtMost(n - 1)
-            val i2 = (i + 1).coerceAtMost(n - 1)
-            val fr = x - i
-            val v = (s(i) * (1 - fr) + s(i2) * fr).toInt()
-            o[2 * j] = v.toByte()
-            o[2 * j + 1] = (v shr 8).toByte()
-        }
-        return o
-    }
-
-    private fun writeHeader(raf: RandomAccessFile, rate: Int, dataLen: Long) {
-        val h = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN)
-        h.put("RIFF".toByteArray()).putInt((36 + dataLen).toInt())
-        h.put("WAVE".toByteArray()).put("fmt ".toByteArray())
-        h.putInt(16).putShort(1).putShort(1).putInt(rate).putInt(rate * 2).putShort(2).putShort(16)
-        h.put("data".toByteArray()).putInt(dataLen.toInt())
-        raf.seek(0)
-        raf.write(h.array())
+        return 0L
     }
 }

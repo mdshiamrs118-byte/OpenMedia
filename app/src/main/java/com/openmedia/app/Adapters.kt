@@ -81,11 +81,11 @@ class TrackAdapter(private val ctx: Context, var data: List<Track>) : BaseAdapte
     override fun getView(position: Int, convertView: View?, parent: ViewGroup?): View {
         val v = convertView ?: inf.inflate(R.layout.item_track, parent, false)
         val t = data[position]
-        v.findViewById<TextView>(R.id.title).text = t.videoTitle
+        v.findViewById<TextView>(R.id.title).text = t.set.videoTitle
         v.findViewById<TextView>(R.id.sub).text =
-            if (t.subtitleName.isEmpty()) "Subtitle: unknown" else "Subtitle: ${t.subtitleName}"
+            if (t.set.subName.isEmpty()) "Subtitle: unknown" else "Subtitle: ${t.set.subName}"
         v.findViewById<TextView>(R.id.meta).text =
-            "${Fmt.date(t.dateSec)}  •  ${Fmt.size(ctx, t.size)}  •  ${Fmt.time(t.durationMs)}"
+            "${Fmt.date(t.set.createdSec)}  •  ${Fmt.size(ctx, t.sizeBytes)}  •  ${Fmt.time(t.durationMs)}"
         return v
     }
 }
